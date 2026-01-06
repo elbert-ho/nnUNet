@@ -46,7 +46,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, resample_and_save
-from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+from nnunetv2.inference.predict_from_raw_data_2 import nnUNetPredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
 from nnunetv2.training.data_augmentation.compute_initial_patch_size import get_patch_size
@@ -66,6 +66,12 @@ from nnunetv2.utilities.helpers import empty_cache, dummy_context
 from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to_one_hot, determine_num_input_channels
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
+import buttermilk
+from pylot.util import Config
+from pylot.experiment.util import eval_config
+import yaml
+from buttermilk.experiment.buttermilk_accelerated import SingleDataExperiment
+import einops as E
 
 class nnUNetTrainer(object):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
@@ -148,9 +154,10 @@ class nnUNetTrainer(object):
         self.probabilistic_oversampling = False
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 1000
+        self.num_epochs = 2000
         self.current_epoch = 0
-        self.enable_deep_supervision = True
+        self.enable_deep_supervision = False
+        self.config_file = "/data/ddmg/buttermilk/users/eho29/code/buttermilk/configs/megamedical_nnunet_6stage_framework.yml"
 
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
@@ -212,6 +219,7 @@ class nnUNetTrainer(object):
                 self.configuration_manager.network_arch_init_kwargs_req_import,
                 self.num_input_channels,
                 self.label_manager.num_segmentation_heads,
+                self.config_file,
                 self.enable_deep_supervision
             ).to(self.device)
             # compile network for free speedup
@@ -223,7 +231,7 @@ class nnUNetTrainer(object):
             # if ddp, wrap in DDP wrapper
             if self.is_ddp:
                 self.network = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.network)
-                self.network = DDP(self.network, device_ids=[self.local_rank])
+                self.network = DDP(self.network, device_ids=[self.local_rank], find_unused_parameters=True)
 
             self.loss = self._build_loss()
 
@@ -239,6 +247,8 @@ class nnUNetTrainer(object):
 
     def _do_i_compile(self):
         # new default: compile is enabled!
+        # MUST DELETE ON STUFF THAT IS NOT OREO/MARS/TWIX
+        return False
 
         # compile does not work on mps
         if self.device == torch.device('mps'):
@@ -306,6 +316,7 @@ class nnUNetTrainer(object):
                                    arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
                                    num_input_channels: int,
                                    num_output_channels: int,
+                                   config_file: str = "",
                                    enable_deep_supervision: bool = True) -> nn.Module:
         """
         This is where you build the architecture according to the plans. There is no obligation to use
@@ -326,14 +337,24 @@ class nnUNetTrainer(object):
         should be generated. label_manager takes care of all that for you.)
 
         """
-        return get_network_from_plans(
-            architecture_class_name,
-            arch_init_kwargs,
-            arch_init_kwargs_req_import,
-            num_input_channels,
-            num_output_channels,
-            allow_init=True,
-            deep_supervision=enable_deep_supervision)
+        # WHERE THINGS ARE CHANGED        
+        # Read in the config
+        with open(config_file, 'r') as file: 
+            baseline_cfg = Config(yaml.load(file, Loader=yaml.FullLoader))
+
+        # create model and return it
+        exp = SingleDataExperiment.from_config(baseline_cfg)
+        exp.build_model()
+        return exp.model
+
+        # return get_network_from_plans(
+        #     architecture_class_name,
+        #     arch_init_kwargs,
+        #     arch_init_kwargs_req_import,
+        #     num_input_channels,
+        #     num_output_channels,
+        #     allow_init=True,
+        #     deep_supervision=enable_deep_supervision)
 
     def _get_deep_supervision_scales(self):
         if self.enable_deep_supervision:
@@ -389,22 +410,26 @@ class nnUNetTrainer(object):
             self.oversample_foreground_percent = oversample_percent
 
     def _build_loss(self):
-        if self.label_manager.has_regions:
-            loss = DC_and_BCE_loss({},
-                                   {'batch_dice': self.configuration_manager.batch_dice,
-                                    'do_bg': True, 'smooth': 1e-5, 'ddp': self.is_ddp},
-                                   use_ignore_label=self.label_manager.ignore_label is not None,
-                                   dice_class=MemoryEfficientSoftDiceLoss)
-        else:
-            loss = DC_and_CE_loss({'batch_dice': self.configuration_manager.batch_dice,
-                                   'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1, weight_dice=1,
-                                  ignore_label=self.label_manager.ignore_label, dice_class=MemoryEfficientSoftDiceLoss)
+        with open(self.config_file, 'r') as file: 
+            baseline_cfg = Config(yaml.load(file, Loader=yaml.FullLoader))
+            loss = eval_config(baseline_cfg["loss_func"])
 
-        if self._do_i_compile():
-            loss.dc = torch.compile(loss.dc)
+        # if self.label_manager.has_regions:
+        #     loss = DC_and_BCE_loss({},
+        #                            {'batch_dice': self.configuration_manager.batch_dice,
+        #                             'do_bg': True, 'smooth': 1e-5, 'ddp': self.is_ddp},
+        #                            use_ignore_label=self.label_manager.ignore_label is not None,
+        #                            dice_class=MemoryEfficientSoftDiceLoss)
+        # else:
+        #     loss = DC_and_CE_loss({'batch_dice': self.configuration_manager.batch_dice,
+        #                            'smooth': 1e-5, 'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1, weight_dice=1,
+        #                           ignore_label=self.label_manager.ignore_label, dice_class=MemoryEfficientSoftDiceLoss)
 
-        # we give each output a weight which decreases exponentially (division by 2) as the resolution decreases
-        # this gives higher resolution outputs more weight in the loss
+        # if self._do_i_compile():
+        #     loss.dc = torch.compile(loss.dc)
+
+        # # we give each output a weight which decreases exponentially (division by 2) as the resolution decreases
+        # # this gives higher resolution outputs more weight in the loss
 
         if self.enable_deep_supervision:
             deep_supervision_scales = self._get_deep_supervision_scales()
@@ -901,8 +926,9 @@ class nnUNetTrainer(object):
 
         maybe_mkdir_p(self.output_folder)
 
-        # make sure deep supervision is on in the network
-        self.set_deep_supervision_enabled(self.enable_deep_supervision)
+        # FORCE FALSE BECAUSE ISSUES WITH BUTTERMILK
+        # # make sure deep supervision is on in the network
+        # self.set_deep_supervision_enabled(self.enable_deep_supervision)
 
         self.print_plans()
         empty_cache(self.device)
@@ -926,8 +952,9 @@ class nnUNetTrainer(object):
         shutil.copy(join(self.preprocessed_dataset_folder_base, 'dataset_fingerprint.json'),
                     join(self.output_folder_base, 'dataset_fingerprint.json'))
 
+        # ALREADY CREATED COMMENT OUT FOR NOW TO SAVE TIME CHANGED HERE
         # produces a pdf in output folder
-        self.plot_network_architecture()
+        # self.plot_network_architecture()
 
         self._save_debug_information()
 
@@ -986,9 +1013,48 @@ class nnUNetTrainer(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output = self.network(data)
-            # del data
-            l = self.loss(output, target)
+            # CHANGED HERE BC DEEP SUPERVISION REASONS
+            # output = self.network(data, self.exp.K)
+            output = self.network(data, 8)
+            # print(target[0].shape)
+            # print(target[1].shape)
+            # print(target[2].shape)
+            # print(target[3].shape)
+            # print(target[4].shape)
+
+            # DEEP SUPERVISION?
+            # target = target[0]
+
+            # Reshape y to match yhat if needed
+            if target.shape[1] == 1:
+                yr = E.repeat(target, 'B C H W -> B K C H W', K=8)
+            else:
+                yr = target[:, :, None, :, :]
+
+            # print(output.shape) # torch.Size([2, 8, 1, 128, 128])
+            # print(len(target)) # 5 x torch.Size([2, 1, 128, 128])
+            # print(target[0].shape)
+            # # print(target)
+            # print(self.loss)
+            # exit()
+
+            # print(yr.shape)
+
+            # logits = output          # [B, C, ...]
+            # C = logits.shape[1]
+            # ts = yr if isinstance(yr, (list, tuple)) else [yr]
+            # for i, t in enumerate(ts):
+            #     t = t.long()
+            #     print(f"[sup{i}] C={C}  dtype={t.dtype}  min={t.min().item()}  max={t.max().item()}")
+            #     uniq = torch.unique(t)
+            #     print(f"[sup{i}] uniq (first 20): {uniq[:20].tolist()}")
+            #     bad = (t < 0) | (t >= C)
+            #     if bad.any():
+            #         raise RuntimeError(f"[sup{i}] label out of range for C={C}")
+
+            # exit()
+
+            l = self.loss(output, yr)
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
@@ -1032,9 +1098,19 @@ class nnUNetTrainer(object):
         # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            output = self.network(data)
+            output = self.network(data, 8)
             del data
-            l = self.loss(output, target)
+
+            # CHANGED HERE
+            # Reshape y to match yhat if needed
+            if target.shape[1] == 1:
+                yr = E.repeat(target, 'B C H W -> B K C H W', K=8)
+            else:
+                yr = target[:, :, None, :, :]
+
+            l, best_tensors = self.loss.best_loss(output, yr)
+
+        # CHECK HERE FOR DEEP SUPERVISION
 
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
@@ -1042,16 +1118,25 @@ class nnUNetTrainer(object):
             target = target[0]
 
         # the following is needed for online evaluation. Fake dice (green line)
-        axes = [0] + list(range(2, output.ndim))
+        axes = [0] + list(range(2, best_tensors.ndim))
 
-        if self.label_manager.has_regions:
-            predicted_segmentation_onehot = (torch.sigmoid(output) > 0.5).long()
-        else:
-            # no need for softmax
-            output_seg = output.argmax(1)[:, None]
-            predicted_segmentation_onehot = torch.zeros(output.shape, device=output.device, dtype=torch.float32)
-            predicted_segmentation_onehot.scatter_(1, output_seg, 1)
-            del output_seg
+        # print(self.label_manager.has_regions)
+        # print(self.label_manager.has_ignore_label)
+        # print(best_tensors.unique())
+
+        # if self.label_manager.has_regions:
+        #     predicted_segmentation_onehot = (torch.sigmoid(best_tensors) > 0.5).long()
+        # else:
+        #     # no need for softmax
+        #     output_seg = best_tensors.argmax(1)[:, None]
+        #     predicted_segmentation_onehot = torch.zeros(best_tensors.shape, device=best_tensors.device, dtype=torch.float32)
+        #     predicted_segmentation_onehot.scatter_(1, output_seg, 1)
+        #     del output_seg
+
+        p = torch.sigmoid(best_tensors)            # (B, 1, H, W) in [0,1]
+
+        # Build 2-channel probs: background & foreground
+        net_output = torch.cat([1 - p, p], dim=1)   # (B, 2, H, W)
 
         if self.label_manager.has_ignore_label:
             if not self.label_manager.has_regions:
@@ -1068,16 +1153,22 @@ class nnUNetTrainer(object):
         else:
             mask = None
 
-        tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, target, axes=axes, mask=mask)
 
-        tp_hard = tp.detach().cpu().numpy()
-        fp_hard = fp.detach().cpu().numpy()
-        fn_hard = fn.detach().cpu().numpy()
+        # print(predicted_segmentation_onehot.unique())
+        # print(target.unique())
+        target = target.long()
+        tp, fp, fn, _ = get_tp_fp_fn_tn(net_output, target, axes=axes, mask=mask)
+
+        tp_hard = tp.detach().cpu().numpy().astype(np.float64)
+        fp_hard = fp.detach().cpu().numpy().astype(np.float64)
+        fn_hard = fn.detach().cpu().numpy().astype(np.float64)
+
+        # ASK ABOUT THIS CODE HERE?
         if not self.label_manager.has_regions:
-            # if we train with regions all segmentation heads predict some kind of foreground. In conventional
-            # (softmax training) there needs tobe one output for the background. We are not interested in the
-            # background Dice
-            # [1:] in order to remove background
+             # if we train with regions all segmentation heads predict some kind of foreground. In conventional
+             # (softmax training) there needs to be one output for the background. We are not interested in the
+             # background Dice
+             # [1:] in order to remove background
             tp_hard = tp_hard[1:]
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
@@ -1111,8 +1202,16 @@ class nnUNetTrainer(object):
         else:
             loss_here = np.mean(outputs_collated['loss'])
 
+        # tp = tp.astype(np.float64)
+        # fp = fp.astype(np.float64)
+        # fn = fn.astype(np.float64)
+
         global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
         mean_fg_dice = np.nanmean(global_dc_per_class)
+
+        # print(mean_fg_dice)
+        # print(global_dc_per_class)
+
         self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
@@ -1210,7 +1309,10 @@ class nnUNetTrainer(object):
                 self.grad_scaler.load_state_dict(checkpoint['grad_scaler_state'])
 
     def perform_actual_validation(self, save_probabilities: bool = False):
-        self.set_deep_supervision_enabled(False)
+        # THIS CAUSES ISSUES SO COMMENTED OUT ESSENTIALLY :)
+        pass
+        # CHANGED HERE
+        # self.set_deep_supervision_enabled(False)
         self.network.eval()
 
         if self.is_ddp and self.batch_size == 1 and self.enable_deep_supervision and self._do_i_compile():
@@ -1356,7 +1458,7 @@ class nnUNetTrainer(object):
             self.print_to_log_file("Mean Validation Dice: ", (metrics['foreground_mean']["Dice"]),
                                    also_print_to_console=True)
 
-        self.set_deep_supervision_enabled(True)
+        # self.set_deep_supervision_enabled(True)
         compute_gaussian.cache_clear()
 
     def run_training(self):

@@ -66,7 +66,8 @@ class nnUNetPredictor(object):
 
     def initialize_from_trained_model_folder(self, model_training_output_dir: str,
                                              use_folds: Union[Tuple[Union[int, str]], None],
-                                             checkpoint_name: str = 'checkpoint_final.pth'):
+                                             checkpoint_name: str = 'checkpoint_final.pth', 
+                                             config_file: str = ''):
         """
         This is used when making predictions with a trained model
         """
@@ -107,6 +108,7 @@ class nnUNetPredictor(object):
             configuration_manager.network_arch_init_kwargs_req_import,
             num_input_channels,
             plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
+            config_file,
             enable_deep_supervision=False
         )
 
@@ -352,13 +354,33 @@ class nnUNetPredictor(object):
                                    save_probabilities: bool = False,
                                    num_processes_segmentation_export: int = default_num_processes):
         """
-        each element returned by data_iterator must be a dict with 'data', 'ofile' and 'data_properties' keys!
-        If 'ofile' is None, the result will be returned instead of written to a file
+        Each element from data_iterator must be a dict with keys:
+            'data': np.ndarray or path to .npy (C, ...)
+            'ofile': truncated output filename (str) or None
+            'data_properties': dict with spacing/origin/etc.
+
+        If all 'ofile' are not None:
+            - Writes K segmentations per case: ofile_k0, ofile_k1, ..., ofile_k{K-1}
+            - Returns None.
+
+        If all 'ofile' are None:
+            - Returns list over cases; each entry is a list of K segmentations.
+              ret[case_idx][k] -> segmentation for hypothesis k.
         """
-        with multiprocessing.get_context("spawn").Pool(num_processes_segmentation_export) as export_pool:
-            worker_list = [i for i in export_pool._pool]
-            r = []
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(num_processes_segmentation_export) as export_pool:
+            worker_list = [w for w in export_pool._pool]
+
+            # flat registry of all AsyncResult for throttling & sync
+            all_async_results = []
+            # per-case jobs for in-memory mode
+            results_per_case = []
+
+            disk_mode = None  # True if writing to disk, False if returning results
+            last_data_iterator_elem = None
+
             for preprocessed in data_iterator:
+                last_data_iterator_elem = preprocessed
                 data = preprocessed['data']
                 if isinstance(data, str):
                     delfile = data
@@ -372,136 +394,229 @@ class nnUNetPredictor(object):
                     print(f'\nPredicting image of shape {data.shape}:')
 
                 print(f'perform_everything_on_device: {self.perform_everything_on_device}')
-
                 properties = preprocessed['data_properties']
 
-                # let's not get into a runaway situation where the GPU predicts so fast that the disk has to be swamped with
-                # npy files
-                proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
+                # determine mode on first sample, enforce consistency
+                if disk_mode is None:
+                    disk_mode = ofile is not None
+                else:
+                    assert disk_mode == (ofile is not None), \
+                        "Mixed disk and in-memory outputs in a single predict_from_data_iterator call is not supported."
+
+                # throttle: don't swamp workers
+                proceed = not check_workers_alive_and_busy(
+                    export_pool, worker_list, all_async_results, allowed_num_queued=2
+                )
                 while not proceed:
                     sleep(0.1)
-                    proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
+                    proceed = not check_workers_alive_and_busy(
+                        export_pool, worker_list, all_async_results, allowed_num_queued=2
+                    )
 
-                # convert to numpy to prevent uncatchable memory alignment errors from multiprocessing serialization of torch tensors
-                prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
+                # run model -> (K, C, ...)
+                prediction_all = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
+                K = prediction_all.shape[0]
 
                 if ofile is not None:
-                    print('sending off prediction to background worker for resampling and export')
-                    r.append(
-                        export_pool.starmap_async(
+                    # write K hypotheses to disk
+                    print('sending off prediction to background worker for resampling and export (multi-K)')
+                    C_expected = self.label_manager.num_segmentation_heads
+
+                    for k in range(K):
+                        ofile_k = f"{ofile}_k{k}"
+                        pred_k = prediction_all[k]  # (C?, ...)
+
+                        # If model outputs a single logit channel but label_manager expects 2:
+                        if pred_k.shape[0] == 1 and C_expected == 2:
+                            pred_k = np.concatenate([-pred_k, pred_k], axis=0)  # (2, ...)
+
+                        assert pred_k.shape[0] == C_expected, \
+                            f"Bad number of channels for {ofile_k}: got {pred_k.shape[0]}, expected {C_expected}"
+
+                        ar = export_pool.starmap_async(
                             export_prediction_from_logits,
-                            ((prediction, properties, self.configuration_manager, self.plans_manager,
-                              self.dataset_json, ofile, save_probabilities),)
+                            ((pred_k,
+                            properties,
+                            self.configuration_manager,
+                            self.plans_manager,
+                            self.dataset_json,
+                            ofile_k,
+                            save_probabilities),)
                         )
-                    )
-                else:
-                    print('sending off prediction to background worker for resampling')
-                    r.append(
-                        export_pool.starmap_async(
-                            convert_predicted_logits_to_segmentation_with_correct_shape, (
-                                (prediction, self.plans_manager,
-                                 self.configuration_manager, self.label_manager,
-                                 properties,
-                                 save_probabilities),)
-                        )
-                    )
-                if ofile is not None:
+                        all_async_results.append(ar)
+
+                    print(f'done queuing all K={K} predictions for {os.path.basename(ofile)}')
                     print(f'done with {os.path.basename(ofile)}')
                 else:
-                    print(f'\nDone with image of shape {data.shape}:')
-            ret = [i.get()[0] for i in r]
+                    # return K hypotheses in memory
+                    print('sending off prediction to background worker for resampling (multi-K, returning results)')
+                    jobs_for_case = []
+                    C_expected = self.label_manager.num_segmentation_heads
+                    for k in range(K):
+                        pred_k = prediction_all[k]
+
+                        if pred_k.shape[0] == 1 and C_expected == 2:
+                            pred_k = np.concatenate([-pred_k, pred_k], axis=0)
+
+                        assert pred_k.shape[0] == C_expected
+
+                        ar = export_pool.starmap_async(
+                            convert_predicted_logits_to_segmentation_with_correct_shape,
+                            ((pred_k,
+                            self.plans_manager,
+                            self.configuration_manager,
+                            self.label_manager,
+                            properties,
+                            save_probabilities),)
+                        )
+
+                    results_per_case.append(jobs_for_case)
+                    print(f'Done with image of shape {data.shape}:')
+
+            # collect
+            if disk_mode:
+                # just ensure all exports finished
+                for ar in all_async_results:
+                    ar.get()
+                ret = None
+            else:
+                # results_per_case: list over cases; each is list over K AsyncResults
+                ret = []
+                for jobs_for_case in results_per_case:
+                    # each convert_* returns (seg, probs?) or seg; we mirror old behavior and take [0] as seg
+                    preds_K = [ar.get()[0] for ar in jobs_for_case]
+                    ret.append(preds_K)
 
         if isinstance(data_iterator, MultiThreadedAugmenter):
             data_iterator._finish()
 
-        # clear lru cache
+        # clear caches
         compute_gaussian.cache_clear()
-        # clear device cache
         empty_cache(self.device)
+
         return ret
 
-    def predict_single_npy_array(self, input_image: np.ndarray, image_properties: dict,
+
+    def predict_single_npy_array(self,
+                                 input_image: np.ndarray,
+                                 image_properties: dict,
                                  segmentation_previous_stage: np.ndarray = None,
                                  output_file_truncated: str = None,
                                  save_or_return_probabilities: bool = False):
+        pass
         """
-        WARNING: SLOW. ONLY USE THIS IF YOU CANNOT GIVE NNUNET MULTIPLE IMAGES AT ONCE FOR SOME REASON.
+        SLOW. Only for when you cannot batch images.
 
+        input_image:
+            Loaded in nnU-Net's expected axis order (see plans image_reader_writer).
+        image_properties:
+            Must at least contain 'spacing'. Typically comes from the same reader.
+        segmentation_previous_stage:
+            One-hot seg from previous stage if cascaded; else None.
 
-        input_image: Make sure to load the image in the way nnU-Net expects! nnU-Net is trained on a certain axis
-                     ordering which cannot be disturbed in inference,
-                     otherwise you will get bad results. The easiest way to achieve that is to use the same I/O class
-                     for loading images as was used during nnU-Net preprocessing! You can find that class in your
-                     plans.json file under the key "image_reader_writer". If you decide to freestyle, know that the
-                     default axis ordering for medical images is the one from SimpleITK. If you load with nibabel,
-                     you need to transpose your axes AND your spacing from [x,y,z] to [z,y,x]!
-        image_properties must only have a 'spacing' key!
+        Behavior with multi-K:
+        - Network produces logits of shape (K, C, ...).
+        - If output_file_truncated is given:
+            writes K segmentations:
+                {output_file_truncated}_k0, ..., _k{K-1}
+            returns None.
+        - If output_file_truncated is None:
+            if save_or_return_probabilities is False:
+                returns [seg_k0, ..., seg_k{K-1}]
+            else:
+                returns ( [seg_k*], [prob_k*] )
         """
-        ppa = PreprocessAdapterFromNpy([input_image], [segmentation_previous_stage], [image_properties],
-                                       [output_file_truncated],
-                                       self.plans_manager, self.dataset_json, self.configuration_manager,
-                                       num_threads_in_multithreaded=1, verbose=self.verbose)
+        ppa = PreprocessAdapterFromNpy(
+            [input_image],
+            [segmentation_previous_stage],
+            [image_properties],
+            [output_file_truncated],
+            self.plans_manager,
+            self.dataset_json,
+            self.configuration_manager,
+            num_threads_in_multithreaded=1,
+            verbose=self.verbose
+        )
+
         if self.verbose:
             print('preprocessing')
-        dct = next(ppa)
+        dct = next(ppa)  # single case
 
         if self.verbose:
             print('predicting')
-        predicted_logits = self.predict_logits_from_preprocessed_data(dct['data']).cpu()
+        # (K, C, ...)
+        predicted_logits = self.predict_logits_from_preprocessed_data(dct['data']).cpu().numpy()
+        K = predicted_logits.shape[0]
 
         if self.verbose:
             print('resampling to original shape')
+
         if output_file_truncated is not None:
-            export_prediction_from_logits(predicted_logits, dct['data_properties'], self.configuration_manager,
-                                          self.plans_manager, self.dataset_json, output_file_truncated,
-                                          save_or_return_probabilities)
+            # write K hypotheses
+            for k in range(K):
+                of_k = f"{output_file_truncated}_k{k}"
+                export_prediction_from_logits(
+                    predicted_logits[k],
+                    dct['data_properties'],
+                    self.configuration_manager,
+                    self.plans_manager,
+                    self.dataset_json,
+                    of_k,
+                    save_or_return_probabilities
+                )
+            return None
         else:
-            ret = convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits, self.plans_manager,
-                                                                              self.configuration_manager,
-                                                                              self.label_manager,
-                                                                              dct['data_properties'],
-                                                                              return_probabilities=
-                                                                              save_or_return_probabilities)
+            segs = []
+            probs = [] if save_or_return_probabilities else None
+
+            for k in range(K):
+                out = convert_predicted_logits_to_segmentation_with_correct_shape(
+                    predicted_logits[k],
+                    self.plans_manager,
+                    self.configuration_manager,
+                    self.label_manager,
+                    dct['data_properties'],
+                    return_probabilities=save_or_return_probabilities
+                )
+                if save_or_return_probabilities:
+                    seg_k, prob_k = out
+                    segs.append(seg_k)
+                    probs.append(prob_k)
+                else:
+                    segs.append(out)
+
             if save_or_return_probabilities:
-                return ret[0], ret[1]
+                return segs, probs
             else:
-                return ret
+                return segs
 
     @torch.inference_mode()
     def predict_logits_from_preprocessed_data(self, data: torch.Tensor) -> torch.Tensor:
-        """
-        IMPORTANT! IF YOU ARE RUNNING THE CASCADE, THE SEGMENTATION FROM THE PREVIOUS STAGE MUST ALREADY BE STACKED ON
-        TOP OF THE IMAGE AS ONE-HOT REPRESENTATION! SEE PreprocessAdapter ON HOW THIS SHOULD BE DONE!
-
-        RETURNED LOGITS HAVE THE SHAPE OF THE INPUT. THEY MUST BE CONVERTED BACK TO THE ORIGINAL IMAGE SIZE.
-        SEE convert_predicted_logits_to_segmentation_with_correct_shape
-        """
         n_threads = torch.get_num_threads()
         torch.set_num_threads(default_num_processes if default_num_processes < n_threads else n_threads)
         prediction = None
 
         for params in self.list_of_parameters:
-
-            # messing with state dict names...
             if not isinstance(self.network, OptimizedModule):
                 self.network.load_state_dict(params)
             else:
                 self.network._orig_mod.load_state_dict(params)
 
-            # why not leave prediction on device if perform_everything_on_device? Because this may cause the
-            # second iteration to crash due to OOM. Grabbing that with try except cause way more bloated code than
-            # this actually saves computation time
+            fold_pred = self.predict_sliding_window_return_logits(data).to('cpu')  # (K, C, ...)
+
             if prediction is None:
-                prediction = self.predict_sliding_window_return_logits(data).to('cpu')
+                prediction = fold_pred
             else:
-                prediction += self.predict_sliding_window_return_logits(data).to('cpu')
+                prediction += fold_pred
 
         if len(self.list_of_parameters) > 1:
             prediction /= len(self.list_of_parameters)
 
-        if self.verbose: print('Prediction done')
+        if self.verbose:
+            print('Prediction done')
         torch.set_num_threads(n_threads)
-        return prediction
+        return prediction  # (K, C, ...)
+
 
     def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]):
         slicers = []
@@ -539,34 +654,63 @@ class nnUNetPredictor(object):
 
     @torch.inference_mode()
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, C, spatial...)
+        return: (B, K, C, spatial...)
+        where K is the stochastic/hypothesis dimension.
+        """
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
+        # base prediction: (B, K, C, ...)
         prediction = self.network(x, 8)
 
         if mirror_axes is not None:
-            # check for invalid numbers in mirror_axes
-            # x should be 5d for 3d images and 4d for 2d. so the max value of mirror_axes cannot exceed len(x.shape) - 3
-            assert max(mirror_axes) <= x.ndim - 3, 'mirror_axes does not match the dimension of the input!'
+            # validate axes w.r.t. input x (B, C, ...)
+            assert max(mirror_axes) <= x.ndim - 3, 'mirror_axes do not match input dimension!'
+            # spatial axes in x
+            input_axes = [m + 2 for m in mirror_axes]
 
-            mirror_axes = [m + 2 for m in mirror_axes]
+            # all non-empty combinations of flip axes
             axes_combinations = [
-                c for i in range(len(mirror_axes)) for c in itertools.combinations(mirror_axes, i + 1)
+                c for i in range(len(input_axes)) for c in itertools.combinations(input_axes, i + 1)
             ]
-            for axes in axes_combinations:
-                prediction += torch.flip(self.network(torch.flip(x, axes), 8), axes)
+
+            for axes_in in axes_combinations:
+                # flip input on spatial dims
+                x_flipped = torch.flip(x, axes_in)
+                # predict: (B, K, C, ...)
+                p = self.network(x_flipped, 8)
+
+                # map input flip axes to prediction flip axes
+                # prediction has (B, K, C, spatial...), so each spatial dim index is +1 vs input
+                axes_out = tuple(a + 1 for a in axes_in)
+                p = torch.flip(p, axes_out)
+                prediction += p
+
             prediction /= (len(axes_combinations) + 1)
-        return prediction
+        return prediction  # (B, K, C, ...)
+
 
     @torch.inference_mode()
-    def _internal_predict_sliding_window_return_logits(self,
-                                                       data: torch.Tensor,
-                                                       slicers,
-                                                       do_on_device: bool = True,
-                                                       ):
-        predicted_logits = n_predictions = prediction = gaussian = workon = None
+    def _internal_predict_sliding_window_return_logits(
+        self,
+        data: torch.Tensor,
+        slicers,
+        do_on_device: bool = True,
+    ) -> torch.Tensor:
+        """
+        data: (C, full_spatial...)
+        returns: (K, C, full_spatial...)
+        """
+        predicted_logits = None
+        n_predictions = None
+        gaussian = None
+        workon = None
+
         results_device = self.device if do_on_device else torch.device('cpu')
 
         def producer(d, slh, q):
             for s in slh:
+                # d[s]: (C, patch...)
                 q.put((torch.clone(d[s][None], memory_format=torch.contiguous_format).to(self.device), s))
             q.put('end')
 
@@ -577,22 +721,18 @@ class nnUNetPredictor(object):
             if self.verbose:
                 print(f'move image to device {results_device}')
             data = data.to(results_device)
+
             queue = Queue(maxsize=2)
             t = Thread(target=producer, args=(data, slicers, queue))
             t.start()
 
-            # preallocate arrays
-            if self.verbose:
-                print(f'preallocating results arrays on device {results_device}')
-            predicted_logits = torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]),
-                                           dtype=torch.half,
-                                           device=results_device)
-            n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
-
             if self.use_gaussian:
-                gaussian = compute_gaussian(tuple(self.configuration_manager.patch_size), sigma_scale=1. / 8,
-                                            value_scaling_factor=10,
-                                            device=results_device)
+                gaussian = compute_gaussian(
+                    tuple(self.configuration_manager.patch_size),
+                    sigma_scale=1. / 8,
+                    value_scaling_factor=10,
+                    device=results_device
+                )
             else:
                 gaussian = 1
 
@@ -605,79 +745,116 @@ class nnUNetPredictor(object):
                     if item == 'end':
                         queue.task_done()
                         break
-                    workon, sl = item
-                    prediction = self._internal_maybe_mirror_and_predict(workon)[0].to(results_device)
 
+                    workon, sl = item
+                    # (1, C, patch...) -> (1, K, C, patch...)
+                    patch_pred = self._internal_maybe_mirror_and_predict(workon)
+                    # drop batch: (K, C, patch...)
+                    patch_pred = patch_pred[0].to(results_device)
+
+                    # lazy init of accumulators once we know K, C
+                    if predicted_logits is None:
+                        K, C = patch_pred.shape[0], patch_pred.shape[1]
+                        full_spatial = data.shape[1:]
+                        predicted_logits = torch.zeros(
+                            (K, C, *full_spatial),
+                            dtype=torch.half,
+                            device=results_device
+                        )
+                        n_predictions = torch.zeros(
+                            full_spatial,
+                            dtype=torch.half,
+                            device=results_device
+                        )
+
+                    # apply gaussian if needed (broadcast to (K, C, patch...))
                     if self.use_gaussian:
-                        prediction *= gaussian
-                    predicted_logits[sl] += prediction
-                    n_predictions[sl[1:]] += gaussian
+                        patch_pred *= gaussian
+
+                    # sl is (slice(None), *spatial_slices) for (C, ...)
+                    spatial_sl = sl[1:]  # ignore channel slice
+
+                    # accumulate
+                    predicted_logits[(slice(None), slice(None), *spatial_sl)] += patch_pred
+                    n_predictions[spatial_sl] += gaussian
+
                     queue.task_done()
                     pbar.update()
+
             queue.join()
 
-            # predicted_logits /= n_predictions
+            # normalize
+            # n_predictions: (full_spatial,)
+            # broadcast divide across (K, C)
             torch.div(predicted_logits, n_predictions, out=predicted_logits)
-            # check for infs
+
+            # inf check
             if torch.any(torch.isinf(predicted_logits)):
-                raise RuntimeError('Encountered inf in predicted array. Aborting... If this problem persists, '
-                                   'reduce value_scaling_factor in compute_gaussian or increase the dtype of '
-                                   'predicted_logits to fp32')
+                raise RuntimeError(
+                    'Encountered inf in predicted array. If this persists, adjust value_scaling_factor or dtype.'
+                )
+
         except Exception as e:
-            del predicted_logits, n_predictions, prediction, gaussian, workon
+            del predicted_logits, n_predictions, gaussian, workon
             empty_cache(self.device)
             empty_cache(results_device)
             raise e
-        return predicted_logits
+
+        return predicted_logits  # (K, C, full_spatial...)
+
 
     @torch.inference_mode()
-    def predict_sliding_window_return_logits(self, input_image: torch.Tensor) \
-            -> Union[np.ndarray, torch.Tensor]:
+    def predict_sliding_window_return_logits(self, input_image: torch.Tensor) -> torch.Tensor:
         assert isinstance(input_image, torch.Tensor)
         self.network = self.network.to(self.device)
         self.network.eval()
 
         empty_cache(self.device)
 
-        # Autocast can be annoying
-        # If the device_type is 'cpu' then it's slow as heck on some CPUs (no auto bfloat16 support detection)
-        # and needs to be disabled.
-        # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False
-        # is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
-        # So autocast will only be active if we have a cuda device.
         with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-            assert input_image.ndim == 4, 'input_image must be a 4D np.ndarray or torch.Tensor (c, x, y, z)'
+            assert input_image.ndim == 4, 'input_image must be 4D (c, x, y, z)'
 
             if self.verbose:
                 print(f'Input shape: {input_image.shape}')
                 print("step_size:", self.tile_step_size)
                 print("mirror_axes:", self.allowed_mirroring_axes if self.use_mirroring else None)
 
-            # if input_image is smaller than tile_size we need to pad it to tile_size.
-            data, slicer_revert_padding = pad_nd_image(input_image, self.configuration_manager.patch_size,
-                                                       'constant', {'value': 0}, True,
-                                                       None)
+            data, slicer_revert_padding = pad_nd_image(
+                input_image,
+                self.configuration_manager.patch_size,
+                'constant', {'value': 0},
+                True,
+                None
+            )
 
             slicers = self._internal_get_sliding_window_slicers(data.shape[1:])
 
             if self.perform_everything_on_device and self.device != 'cpu':
-                # we need to try except here because we can run OOM in which case we need to fall back to CPU as a results device
                 try:
-                    predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
-                                                                                           self.perform_everything_on_device)
+                    predicted_logits = self._internal_predict_sliding_window_return_logits(
+                        data, slicers, self.perform_everything_on_device
+                    )
                 except RuntimeError:
-                    print(
-                        'Prediction on device was unsuccessful, probably due to a lack of memory. Moving results arrays to CPU')
+                    print('OOM on device, falling back to CPU for accumulation')
                     empty_cache(self.device)
-                    predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers, False)
+                    predicted_logits = self._internal_predict_sliding_window_return_logits(
+                        data, slicers, False
+                    )
             else:
-                predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
-                                                                                       self.perform_everything_on_device)
+                predicted_logits = self._internal_predict_sliding_window_return_logits(
+                    data, slicers, self.perform_everything_on_device
+                )
 
             empty_cache(self.device)
+
             # revert padding
-            predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
-        return predicted_logits
+            # slicer_revert_padding is for (C, spatial...), so skip its first element
+            predicted_logits = predicted_logits[
+                (slice(None), slice(None), *slicer_revert_padding[1:])
+            ]
+
+        return predicted_logits  # (K, C, ...)
+
 
     def predict_from_files_sequential(self,
                            list_of_lists_or_source_folder: Union[str, List[List[str]]],
@@ -749,16 +926,48 @@ class nnUNetPredictor(object):
 
             print(f'perform_everything_on_device: {self.perform_everything_on_device}')
 
-            prediction = self.predict_logits_from_preprocessed_data(torch.from_numpy(data)).cpu()
+            prediction_all = self.predict_logits_from_preprocessed_data(torch.from_numpy(data)).cpu().numpy()
+            K = prediction_all.shape[0]
+
+            C_expected = self.label_manager.num_segmentation_heads
 
             if of is not None:
-                export_prediction_from_logits(prediction, data_properties, self.configuration_manager, self.plans_manager,
-                  self.dataset_json, of, save_probabilities)
+                for k in range(K):
+                    of_k = f"{of}_k{k}"
+                    pred_k = prediction_all[k]
+
+                    if pred_k.shape[0] == 1 and C_expected == 2:
+                        pred_k = np.concatenate([-pred_k, pred_k], axis=0)
+
+                    assert pred_k.shape[0] == C_expected
+
+                    export_prediction_from_logits(
+                        pred_k,
+                        data_properties,
+                        self.configuration_manager,
+                        self.plans_manager,
+                        self.dataset_json,
+                        of_k,
+                        save_probabilities
+                    )
             else:
-                ret.append(convert_predicted_logits_to_segmentation_with_correct_shape(prediction, self.plans_manager,
-                     self.configuration_manager, self.label_manager,
-                     data_properties,
-                     save_probabilities))
+                segs_for_case = []
+                for k in range(K):
+                    pred_k = prediction_all[k]
+                    if pred_k.shape[0] == 1 and C_expected == 2:
+                        pred_k = np.concatenate([-pred_k, pred_k], axis=0)
+                    assert pred_k.shape[0] == C_expected
+
+                    seg_k = convert_predicted_logits_to_segmentation_with_correct_shape(
+                        pred_k,
+                        self.plans_manager,
+                        self.configuration_manager,
+                        self.label_manager,
+                        data_properties,
+                        save_probabilities
+                    )
+                    segs_for_case.append(seg_k)
+                ret.append(segs_for_case)
 
         # clear lru cache
         compute_gaussian.cache_clear()
