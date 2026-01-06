@@ -1,6 +1,7 @@
 import subprocess
 import time
 import requests
+import os
 
 # =============================
 # CONFIG
@@ -10,8 +11,8 @@ import requests
 DATASETS = [760]   # <- EDIT THESE
 
 # 2. Telegram credentials
-BOT_TOKEN = "8158486790:AAGI4w4CpXhDJCcSTOPXTVDfcYCVi5WtqAg"
-CHAT_ID = "5987867110"
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 # =============================
 # FUNCTIONS
