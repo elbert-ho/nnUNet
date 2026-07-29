@@ -19,6 +19,7 @@ from pathlib import Path
 def main():
     dataset_ids = [100, 670, 671, 672, 673, 760]
     dataset_names = ["ProstateTk1", "STAREm", "ProstateTk2", "BrainGrowth", "QubiqKidney", "LIDC_IDRIv3"]
+    PHASE = "Test"
     for dataset_id, dataset_name in zip(dataset_ids, dataset_names):
 
         if dataset_id == 100 or dataset_id == 671 or dataset_id == 760:
@@ -27,11 +28,11 @@ def main():
             config_file = "/data/ddmg/buttermilk/users/eho29/code/buttermilk/configs/megamedical_nnunet_5stage_framework.yml"
 
         model_folder = f"/data/ddmg/buttermilk/users/eho29/data/nnUNet_results/Dataset{dataset_id}_{dataset_name}/nnUNetTrainer__nnUNetPlans__2d"  # folder containing fold_0, fold_1, ... etc
-        input_folder = f"/data/ddmg/buttermilk/users/eho29/data/{dataset_name}_Val/imagesVal"       # where your .nii.gz live (properly named _0000 etc)
-        output_folder = f"/data/ddmg/buttermilk/users/eho29/data/{dataset_name}_Val/predictions"   # will be created if needed
+        input_folder = f"/data/ddmg/buttermilk/users/eho29/data/{dataset_name}_{PHASE}/images{PHASE}"       # where your .nii.gz live (properly named _0000 etc)
+        output_folder = f"/data/ddmg/buttermilk/users/eho29/data/{dataset_name}_{PHASE}/predictions"   # will be created if needed
         pred_root = output_folder
-        gt_root = f"/data/ddmg/buttermilk/users/eho29/data/{dataset_name}_Val/labelsVal"
-        df_path = f"/data/ddmg/buttermilk/users/eho29/data/{dataset_name}_Val"
+        gt_root = f"/data/ddmg/buttermilk/users/eho29/data/{dataset_name}_{PHASE}/labels{PHASE}"
+        df_path = f"/data/ddmg/buttermilk/users/eho29/data/{dataset_name}_{PHASE}"
         df_path = Path(df_path)
 
         predictor = nnUNetPredictor(
@@ -141,7 +142,7 @@ def main():
 
                 rows.append(
                     {
-                        "phase": "val",
+                        "phase": f"{PHASE.lower()}",
                         "subject": i,
                         "ensemble_score": dice,
                         "best_soft_dice": bdice,
@@ -160,7 +161,7 @@ def main():
 
                 rows_dists.append(
                     {
-                        "phase": "val",
+                        "phase": f"{PHASE.lower()}",
                         "subject": i,
                         "dataset": "Megamedical",
                         "GED": ged,
@@ -171,11 +172,11 @@ def main():
                 )
 
         df = pd.DataFrame.from_records(rows)
-        autosave(df, df_path / "inference" / "breakdown-val_id.parquet")
+        autosave(df, df_path / "inference" / f"breakdown-{PHASE.lower()}_id.parquet")
 
         if rows_dists is not None:
             df_dists = pd.DataFrame.from_records(rows_dists)
-            autosave(df_dists, df_path / "inference" / "breakdown-dists-val_id.parquet")
+            autosave(df_dists, df_path / "inference" / f"breakdown-dists-{PHASE.lower()}_id.parquet")
     
         print(f"Finished processing {dataset_name}")
 
