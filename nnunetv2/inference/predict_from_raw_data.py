@@ -1,5 +1,6 @@
 import inspect
 import itertools
+import warnings
 import multiprocessing
 import os
 from copy import deepcopy
@@ -15,11 +16,9 @@ from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAu
 from batchgenerators.utilities.file_and_folder_operations import load_json, join, isfile, maybe_mkdir_p, isdir, subdirs, \
     save_json
 from torch import nn
-from torch._dynamo import OptimizedModule
 from torch.nn.parallel import DistributedDataParallel
 from tqdm import tqdm
 
-import nnunetv2
 from nnunetv2.configuration import default_num_processes
 from nnunetv2.inference.data_iterators import PreprocessAdapterFromNpy, preprocessing_iterator_fromfiles, \
     preprocessing_iterator_fromnpy
@@ -28,10 +27,13 @@ from nnunetv2.inference.export_prediction import export_prediction_from_logits, 
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian, \
     compute_steps_for_sliding_window
 from nnunetv2.utilities.file_path_utilities import get_output_folder, check_workers_alive_and_busy
-from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
-from nnunetv2.utilities.helpers import empty_cache, dummy_context
+from nnunetv2.utilities.checkpoints import find_checkpoint_file, load_checkpoint_file
+from nnunetv2.utilities.find_objects import recursive_find_trainer_class_by_name
+from nnunetv2.utilities.helpers import empty_cache, dummy_context, is_optimized_module, \
+    set_default_inductor_cache_dir
 from nnunetv2.utilities.json_export import recursive_fix_for_json_export
-from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
+from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels, \
+    convert_labelmap_to_one_hot
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
 from nnunetv2.utilities.utils import create_lists_from_splitted_dataset_folder
 
@@ -59,16 +61,19 @@ class nnUNetPredictor(object):
         if device.type == 'cuda':
             torch.backends.cudnn.benchmark = True
         else:
-            print(f'perform_everything_on_device=True is only supported for cuda devices! Setting this to False')
+            print('perform_everything_on_device=True is only supported for cuda devices! Setting this to False')
             perform_everything_on_device = False
         self.device = device
         self.perform_everything_on_device = perform_everything_on_device
 
     def initialize_from_trained_model_folder(self, model_training_output_dir: str,
                                              use_folds: Union[Tuple[Union[int, str]], None],
-                                             checkpoint_name: str = 'checkpoint_final.pth'):
+                                             checkpoint_name: str = 'checkpoint_final.safetensors'):
         """
         This is used when making predictions with a trained model
+
+        checkpoint_name may name either format: if the file does not exist, the same name with the other extension
+        (.safetensors <-> .pth) is used. Models trained with older nnU-Net versions have .pth checkpoints.
         """
         if use_folds is None:
             use_folds = nnUNetPredictor.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
@@ -83,8 +88,9 @@ class nnUNetPredictor(object):
         parameters = []
         for i, f in enumerate(use_folds):
             f = int(f) if f != 'all' else f
-            checkpoint = torch.load(join(model_training_output_dir, f'fold_{f}', checkpoint_name),
-                                    map_location=torch.device('cpu'), weights_only=False)
+            checkpoint = load_checkpoint_file(
+                join(model_training_output_dir, f'fold_{f}', checkpoint_name), map_location=torch.device('cpu'),
+                keys=('network_weights', 'trainer_name', 'init_args', 'inference_allowed_mirroring_axes'))
             if i == 0:
                 trainer_name = checkpoint['trainer_name']
                 configuration_name = checkpoint['init_args']['configuration']
@@ -96,19 +102,31 @@ class nnUNetPredictor(object):
         configuration_manager = plans_manager.get_configuration(configuration_name)
         # restore network
         num_input_channels = determine_num_input_channels(plans_manager, configuration_manager, dataset_json)
-        trainer_class = recursive_find_python_class(join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
-                                                    trainer_name, 'nnunetv2.training.nnUNetTrainer')
-        if trainer_class is None:
-            raise RuntimeError(f'Unable to locate trainer class {trainer_name} in nnunetv2.training.nnUNetTrainer. '
-                               f'Please place it there (in any .py file)!')
-        network = trainer_class.build_network_architecture(
-            configuration_manager.network_arch_class_name,
-            configuration_manager.network_arch_init_kwargs,
-            configuration_manager.network_arch_init_kwargs_req_import,
-            num_input_channels,
-            plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
-            enable_deep_supervision=False
-        )
+        trainer_class = recursive_find_trainer_class_by_name(trainer_name)
+        num_output_channels = plans_manager.get_label_manager(dataset_json).num_segmentation_heads
+        sig = inspect.signature(trainer_class.build_network_architecture)
+        if 'plans_manager' in sig.parameters:
+            network = trainer_class.build_network_architecture(
+                plans_manager, configuration_manager,
+                num_input_channels, num_output_channels,
+                enable_deep_supervision=False,
+            )
+        else:
+            warnings.warn(
+                f"Trainer {trainer_name} uses the old build_network_architecture signature. "
+                "Please update to the new signature: "
+                "build_network_architecture(plans_manager, configuration_manager, "
+                "num_input_channels, num_output_channels, enable_deep_supervision). "
+                "The old signature will be removed in a future version.",
+                DeprecationWarning, stacklevel=2,
+            )
+            network = trainer_class.build_network_architecture(
+                configuration_manager.network_arch_class_name,
+                configuration_manager.network_arch_init_kwargs,
+                configuration_manager.network_arch_init_kwargs_req_import,
+                num_input_channels, num_output_channels,
+                enable_deep_supervision=False,
+            )
 
         self.plans_manager = plans_manager
         self.configuration_manager = configuration_manager
@@ -124,8 +142,9 @@ class nnUNetPredictor(object):
         self.allowed_mirroring_axes = inference_allowed_mirroring_axes
         self.label_manager = plans_manager.get_label_manager(dataset_json)
         if ('nnUNet_compile' in os.environ.keys()) and (os.environ['nnUNet_compile'].lower() in ('true', '1', 't')) \
-                and not isinstance(self.network, OptimizedModule):
+                and not is_optimized_module(self.network):
             print('Using torch.compile')
+            set_default_inductor_cache_dir()
             self.network = torch.compile(self.network)
 
     def manual_initialization(self, network: nn.Module, plans_manager: PlansManager,
@@ -146,11 +165,12 @@ class nnUNetPredictor(object):
         allow_compile = True
         allow_compile = allow_compile and ('nnUNet_compile' in os.environ.keys()) and (
                     os.environ['nnUNet_compile'].lower() in ('true', '1', 't'))
-        allow_compile = allow_compile and not isinstance(self.network, OptimizedModule)
+        allow_compile = allow_compile and not is_optimized_module(self.network)
         if isinstance(self.network, DistributedDataParallel):
-            allow_compile = allow_compile and isinstance(self.network.module, OptimizedModule)
+            allow_compile = allow_compile and is_optimized_module(self.network.module)
         if allow_compile:
             print('Using torch.compile')
+            set_default_inductor_cache_dir()
             self.network = torch.compile(self.network)
 
     @staticmethod
@@ -158,7 +178,8 @@ class nnUNetPredictor(object):
         print('use_folds is None, attempting to auto detect available folds')
         fold_folders = subdirs(model_training_output_dir, prefix='fold_', join=False)
         fold_folders = [i for i in fold_folders if i != 'fold_all']
-        fold_folders = [i for i in fold_folders if isfile(join(model_training_output_dir, i, checkpoint_name))]
+        fold_folders = [i for i in fold_folders
+                        if find_checkpoint_file(join(model_training_output_dir, i, checkpoint_name)) is not None]
         use_folds = [int(i.split('_')[-1]) for i in fold_folders]
         print(f'found the following folds: {use_folds}')
         return use_folds
@@ -178,7 +199,7 @@ class nnUNetPredictor(object):
         caseids = [os.path.basename(i[0])[:-(len(self.dataset_json['file_ending']) + 5)] for i in
                    list_of_lists_or_source_folder]
         print(
-            f'I am processing {part_id} out of {num_parts} (max process ID is {num_parts - 1}, we start counting with 0!)')
+            f'I am process {part_id} out of {num_parts} (max process ID is {num_parts - 1}, we start counting with 0!)')
         print(f'There are {len(caseids)} cases that I would like to predict')
 
         if isinstance(output_folder_or_list_of_truncated_output_files, str):
@@ -388,28 +409,45 @@ class nnUNetPredictor(object):
                 if ofile is not None:
                     print('sending off prediction to background worker for resampling and export')
                     r.append(
-                        export_pool.starmap_async(
+                        export_pool.apply_async(
                             export_prediction_from_logits,
-                            ((prediction, properties, self.configuration_manager, self.plans_manager,
-                              self.dataset_json, ofile, save_probabilities),)
+                            (prediction, properties, self.configuration_manager, self.plans_manager,
+                             self.dataset_json, ofile, save_probabilities)
                         )
                     )
                 else:
                     print('sending off prediction to background worker for resampling')
                     r.append(
-                        export_pool.starmap_async(
-                            convert_predicted_logits_to_segmentation_with_correct_shape, (
-                                (prediction, self.plans_manager,
-                                 self.configuration_manager, self.label_manager,
-                                 properties,
-                                 save_probabilities),)
+                        export_pool.apply_async(
+                            convert_predicted_logits_to_segmentation_with_correct_shape,
+                            (prediction, self.plans_manager,
+                             self.configuration_manager, self.label_manager,
+                             properties,
+                             save_probabilities)
                         )
                     )
                 if ofile is not None:
                     print(f'done with {os.path.basename(ofile)}')
                 else:
                     print(f'\nDone with image of shape {data.shape}:')
-            ret = [i.get()[0] for i in r]
+
+            print("GPU prediction completed. Waiting for remaining segmentation exports to finish...")
+            ret = [None] * len(r)
+            with tqdm(desc="Collecting results", total=len(r),
+                      disable=not self.allow_tqdm) as pbar:
+                for i, result in enumerate(r):
+                    while True:
+                        all_alive = all([j.is_alive() for j in worker_list])
+                        if not all_alive:
+                            raise RuntimeError('Segmentation export worker died. It was likely killed by '
+                                               'your OS because of insufficient available CPU RAM.')
+                        try:
+                            ret[i] = result.get(timeout=0.1)
+                            break
+                        except multiprocessing.TimeoutError:
+                            pass
+                    pbar.update()
+            print("Segmentation export complete.")
 
         if isinstance(data_iterator, MultiThreadedAugmenter):
             data_iterator._finish()
@@ -483,7 +521,7 @@ class nnUNetPredictor(object):
         for params in self.list_of_parameters:
 
             # messing with state dict names...
-            if not isinstance(self.network, OptimizedModule):
+            if not is_optimized_module(self.network):
                 self.network.load_state_dict(params)
             else:
                 self.network._orig_mod.load_state_dict(params)
@@ -499,7 +537,8 @@ class nnUNetPredictor(object):
         if len(self.list_of_parameters) > 1:
             prediction /= len(self.list_of_parameters)
 
-        if self.verbose: print('Prediction done')
+        if self.verbose:
+            print('Prediction done')
         torch.set_num_threads(n_threads)
         return prediction
 
@@ -514,7 +553,8 @@ class nnUNetPredictor(object):
                                  'discrepancy of 1 allowed).'
             steps = compute_steps_for_sliding_window(image_size[1:], self.configuration_manager.patch_size,
                                                      self.tile_step_size)
-            if self.verbose: print(f'n_steps {image_size[0] * len(steps[0]) * len(steps[1])}, image size is'
+            if self.verbose:
+                print(f'n_steps {image_size[0] * len(steps[0]) * len(steps[1])}, image size is'
                                    f' {image_size}, tile_size {self.configuration_manager.patch_size}, '
                                    f'tile_step_size {self.tile_step_size}\nsteps:\n{steps}')
             for d in range(image_size[0]):
@@ -526,7 +566,8 @@ class nnUNetPredictor(object):
         else:
             steps = compute_steps_for_sliding_window(image_size, self.configuration_manager.patch_size,
                                                      self.tile_step_size)
-            if self.verbose: print(
+            if self.verbose:
+                print(
                 f'n_steps {np.prod([len(i) for i in steps])}, image size is {image_size}, tile_size {self.configuration_manager.patch_size}, '
                 f'tile_step_size {self.tile_step_size}\nsteps:\n{steps}')
             for sx in steps[0]:
@@ -578,7 +619,7 @@ class nnUNetPredictor(object):
                 print(f'move image to device {results_device}')
             data = data.to(results_device)
             queue = Queue(maxsize=2)
-            t = Thread(target=producer, args=(data, slicers, queue))
+            t = Thread(target=producer, args=(data, slicers, queue), daemon=True)
             t.start()
 
             # preallocate arrays
@@ -623,12 +664,12 @@ class nnUNetPredictor(object):
                 raise RuntimeError('Encountered inf in predicted array. Aborting... If this problem persists, '
                                    'reduce value_scaling_factor in compute_gaussian or increase the dtype of '
                                    'predicted_logits to fp32')
+            return predicted_logits
         except Exception as e:
             del predicted_logits, n_predictions, prediction, gaussian, workon
             empty_cache(self.device)
             empty_cache(results_device)
             raise e
-        return predicted_logits
 
     @torch.inference_mode()
     def predict_sliding_window_return_logits(self, input_image: torch.Tensor) \
@@ -735,7 +776,7 @@ class nnUNetPredictor(object):
         if output_filename_truncated is None:
             output_filename_truncated = [None] * len(list_of_lists_or_source_folder)
         if seg_from_prev_stage_files is None:
-            seg_from_prev_stage_files = [None] * len(seg_from_prev_stage_files)
+            seg_from_prev_stage_files = [None] * len(list_of_lists_or_source_folder)
 
         ret = []
         for li, of, sps in zip(list_of_lists_or_source_folder, output_filename_truncated, seg_from_prev_stage_files):
@@ -746,6 +787,9 @@ class nnUNetPredictor(object):
                 self.configuration_manager,
                 self.dataset_json
             )
+            if folder_with_segs_from_prev_stage is not None:
+                seg_onehot = convert_labelmap_to_one_hot(seg[0], label_manager.foreground_labels, data.dtype)
+                data = np.vstack((data, seg_onehot))
 
             print(f'perform_everything_on_device: {self.perform_everything_on_device}')
 
@@ -804,8 +848,10 @@ def predict_entry_point_modelfolder():
                              'multiple configurations.')
     parser.add_argument('--continue_prediction', '--c', action='store_true',
                         help='Continue an aborted previous prediction (will not overwrite existing files)')
-    parser.add_argument('-chk', type=str, required=False, default='checkpoint_final.pth',
-                        help='Name of the checkpoint you want to use. Default: checkpoint_final.pth')
+    parser.add_argument('-chk', type=str, required=False, default='checkpoint_final.safetensors',
+                        help='Name of the checkpoint you want to use. Default: checkpoint_final.safetensors. If it '
+                             'does not exist, the same name with .pth is used (models trained with older nnU-Net '
+                             'versions have .pth checkpoints), and vice versa.')
     parser.add_argument('-npp', type=int, required=False, default=3,
                         help='Number of processes used for preprocessing. More is not always better. Beware of '
                              'out-of-RAM issues. Default: 3')
@@ -821,6 +867,9 @@ def predict_entry_point_modelfolder():
     parser.add_argument('--disable_progress_bar', action='store_true', required=False, default=False,
                         help='Set this flag to disable progress bar. Recommended for HPC environments (non interactive '
                              'jobs)')
+    parser.add_argument('--not_on_device', action='store_true', required=False, default=False,
+                        help="Set this flag to disable perform_everything_on_device. Recommended for large cases that "
+                             "occupy more VRAM than available")
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -853,7 +902,7 @@ def predict_entry_point_modelfolder():
     predictor = nnUNetPredictor(tile_step_size=args.step_size,
                                 use_gaussian=True,
                                 use_mirroring=not args.disable_tta,
-                                perform_everything_on_device=True,
+                                perform_everything_on_device=not args.not_on_device,
                                 device=device,
                                 verbose=args.verbose,
                                 allow_tqdm=not args.disable_progress_bar,
@@ -905,8 +954,10 @@ def predict_entry_point():
                              'multiple configurations.')
     parser.add_argument('--continue_prediction', action='store_true',
                         help='Continue an aborted previous prediction (will not overwrite existing files)')
-    parser.add_argument('-chk', type=str, required=False, default='checkpoint_final.pth',
-                        help='Name of the checkpoint you want to use. Default: checkpoint_final.pth')
+    parser.add_argument('-chk', type=str, required=False, default='checkpoint_final.safetensors',
+                        help='Name of the checkpoint you want to use. Default: checkpoint_final.safetensors. If it '
+                             'does not exist, the same name with .pth is used (models trained with older nnU-Net '
+                             'versions have .pth checkpoints), and vice versa.')
     parser.add_argument('-npp', type=int, required=False, default=_getDefaultValue('nnUNet_npp', int, 3),
                         help='Number of processes used for preprocessing. More is not always better. Beware of '
                              'out-of-RAM issues. Default: 3')
@@ -930,6 +981,9 @@ def predict_entry_point():
     parser.add_argument('--disable_progress_bar', action='store_true', required=False, default=False,
                         help='Set this flag to disable progress bar. Recommended for HPC environments (non interactive '
                              'jobs)')
+    parser.add_argument('--not_on_device', action='store_true', required=False, default=False,
+                        help="Set this flag to disable perform_everything_on_device. Recommended for large cases that "
+                             "occupy more VRAM than available")
 
     print(
         "\n#######################################################################\nPlease cite the following paper "
@@ -967,7 +1021,7 @@ def predict_entry_point():
     predictor = nnUNetPredictor(tile_step_size=args.step_size,
                                 use_gaussian=True,
                                 use_mirroring=not args.disable_tta,
-                                perform_everything_on_device=True,
+                                perform_everything_on_device=not args.not_on_device,
                                 device=device,
                                 verbose=args.verbose,
                                 verbose_preprocessing=args.verbose,
@@ -977,18 +1031,18 @@ def predict_entry_point():
         args.f,
         checkpoint_name=args.chk
     )
-    
+
     run_sequential = args.nps == 0 and args.npp == 0
-    
+
     if run_sequential:
-        
+
         print("Running in non-multiprocessing mode")
         predictor.predict_from_files_sequential(args.i, args.o, save_probabilities=args.save_probabilities,
                                                 overwrite=not args.continue_prediction,
                                                 folder_with_segs_from_prev_stage=args.prev_stage_predictions)
-    
+
     else:
-        
+
         predictor.predict_from_files(args.i, args.o, save_probabilities=args.save_probabilities,
                                     overwrite=not args.continue_prediction,
                                     num_processes_preprocessing=args.npp,
@@ -996,7 +1050,7 @@ def predict_entry_point():
                                     folder_with_segs_from_prev_stage=args.prev_stage_predictions,
                                     num_parts=args.num_parts,
                                     part_id=args.part_id)
-    
+
     # r = predict_from_raw_data(args.i,
     #                           args.o,
     #                           model_folder,
@@ -1019,7 +1073,7 @@ def predict_entry_point():
 
 if __name__ == '__main__':
     ########################## predict a bunch of files
-    from nnunetv2.paths import nnUNet_results, nnUNet_raw
+    from nnunetv2.paths import nnUNet_results
 
     predictor = nnUNetPredictor(
         tile_step_size=0.5,
@@ -1034,7 +1088,7 @@ if __name__ == '__main__':
     predictor.initialize_from_trained_model_folder(
         join(nnUNet_results, 'Dataset004_Hippocampus/nnUNetTrainer_5epochs__nnUNetPlans__3d_fullres'),
         use_folds=(0,),
-        checkpoint_name='checkpoint_final.pth',
+        checkpoint_name='checkpoint_final.safetensors',
     )
     # predictor.predict_from_files(join(nnUNet_raw, 'Dataset003_Liver/imagesTs'),
     #                              join(nnUNet_raw, 'Dataset003_Liver/imagesTs_predlowres'),
@@ -1055,5 +1109,3 @@ if __name__ == '__main__':
         [['/media/isensee/raw_data/nnUNet_raw/Dataset004_Hippocampus/imagesTs/hippocampus_002_0000.nii.gz'], ['/media/isensee/raw_data/nnUNet_raw/Dataset004_Hippocampus/imagesTs/hippocampus_005_0000.nii.gz']],
         '/home/isensee/temp/tmp', False, True, None
     )
-
-

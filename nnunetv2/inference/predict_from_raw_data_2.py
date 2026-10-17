@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 import nnunetv2
 from nnunetv2.configuration import default_num_processes
+from nnunetv2.utilities.checkpoints import find_checkpoint_file, load_checkpoint_file
 from nnunetv2.inference.data_iterators import PreprocessAdapterFromNpy, preprocessing_iterator_fromfiles, \
     preprocessing_iterator_fromnpy
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, \
@@ -66,7 +67,7 @@ class nnUNetPredictor(object):
 
     def initialize_from_trained_model_folder(self, model_training_output_dir: str,
                                              use_folds: Union[Tuple[Union[int, str]], None],
-                                             checkpoint_name: str = 'checkpoint_final.pth', 
+                                             checkpoint_name: str = 'checkpoint_final.safetensors',
                                              config_file: str = ''):
         """
         This is used when making predictions with a trained model
@@ -84,8 +85,8 @@ class nnUNetPredictor(object):
         parameters = []
         for i, f in enumerate(use_folds):
             f = int(f) if f != 'all' else f
-            checkpoint = torch.load(join(model_training_output_dir, f'fold_{f}', checkpoint_name),
-                                    map_location=torch.device('cpu'), weights_only=False)
+            checkpoint = load_checkpoint_file(join(model_training_output_dir, f'fold_{f}', checkpoint_name),
+                                              map_location=torch.device('cpu'))
             if i == 0:
                 trainer_name = checkpoint['trainer_name']
                 configuration_name = checkpoint['init_args']['configuration']
@@ -103,13 +104,12 @@ class nnUNetPredictor(object):
             raise RuntimeError(f'Unable to locate trainer class {trainer_name} in nnunetv2.training.nnUNetTrainer. '
                                f'Please place it there (in any .py file)!')
         network = trainer_class.build_network_architecture(
-            configuration_manager.network_arch_class_name,
-            configuration_manager.network_arch_init_kwargs,
-            configuration_manager.network_arch_init_kwargs_req_import,
+            plans_manager,
+            configuration_manager,
             num_input_channels,
             plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
-            config_file,
-            enable_deep_supervision=False
+            enable_deep_supervision=False,
+            config_file=config_file,
         )
 
         self.plans_manager = plans_manager
@@ -160,7 +160,7 @@ class nnUNetPredictor(object):
         print('use_folds is None, attempting to auto detect available folds')
         fold_folders = subdirs(model_training_output_dir, prefix='fold_', join=False)
         fold_folders = [i for i in fold_folders if i != 'fold_all']
-        fold_folders = [i for i in fold_folders if isfile(join(model_training_output_dir, i, checkpoint_name))]
+        fold_folders = [i for i in fold_folders if find_checkpoint_file(join(model_training_output_dir, i, checkpoint_name)) is not None]
         use_folds = [int(i.split('_')[-1]) for i in fold_folders]
         print(f'found the following folds: {use_folds}')
         return use_folds
